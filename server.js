@@ -7,7 +7,16 @@ import 'dotenv/config';
 import express from 'express';
 import { createClient } from '@supabase/supabase-js';
 import { v4 as uuidv4 } from 'uuid';
-import { processMessage, getMemoryStats, getMemoryContext, searchByWord } from './ariaCorrelator.js';
+import { 
+  processMessage, 
+  getMemoryStats, 
+  getMemoryContext, 
+  searchByWord,
+  getClusterLinks,
+  getClusterNeighbors,
+  searchClustersByWord,
+  getTopClusterLinks
+} from './ariaCorrelator.js';
 import { generateResponse, queryMemory, buildMemoryContext } from './ariaGenerator.js';
 
 const app = express();
@@ -142,7 +151,7 @@ async function handleNewMessage(message) {
   
   // IGNORE BOT MESSAGES - Never process for memory, never respond to
   if (message.bot_id) {
-    console.log(`⏭️  Ignoring bot message from: ${message.bot_id}`);
+    console.log(`⭐️  Ignoring bot message from: ${message.bot_id}`);
     return;
   }
   
@@ -156,6 +165,9 @@ async function handleNewMessage(message) {
     const memoryResult = await processMessage(content, messageId, message.user_id);
     if (memoryResult.processed) {
       console.log(`   📊 Memory: ${memoryResult.newCorrelations} new, ${memoryResult.reinforced} reinforced`);
+      if (memoryResult.clusterLinks) {
+        console.log(`   🔗 Cluster links: ${memoryResult.clusterLinks.newLinks} new, ${memoryResult.clusterLinks.reinforced} reinforced`);
+      }
     }
   } catch (error) {
     console.error('   ❌ Memory processing error:', error.message);
@@ -335,6 +347,65 @@ app.get('/api/aria', (req, res) => {
 });
 
 // ===============================================
+// NEW: CLUSTER LINK API ENDPOINTS
+// ===============================================
+
+// Get outgoing links from a cluster
+app.get('/api/clusters/links/:cluster', async (req, res) => {
+  try {
+    const { cluster } = req.params;
+    const { limit = 20, minScore = 0.01 } = req.query;
+    const links = await getClusterLinks(cluster, { 
+      limit: parseInt(limit), 
+      minScore: parseFloat(minScore) 
+    });
+    res.json({ cluster, links });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get all neighbors of a cluster
+app.get('/api/clusters/neighbors/:cluster', async (req, res) => {
+  try {
+    const { cluster } = req.params;
+    const { limit = 30, minScore = 0.01 } = req.query;
+    const neighbors = await getClusterNeighbors(cluster, {
+      limit: parseInt(limit),
+      minScore: parseFloat(minScore)
+    });
+    res.json({ cluster, ...neighbors });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Search clusters by word
+app.get('/api/clusters/search', async (req, res) => {
+  try {
+    const { q, limit = 50 } = req.query;
+    if (!q) {
+      return res.status(400).json({ error: 'Query parameter "q" required' });
+    }
+    const clusters = await searchClustersByWord(q, { limit: parseInt(limit) });
+    res.json({ query: q, clusters });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get top cluster links
+app.get('/api/clusters/top', async (req, res) => {
+  try {
+    const { limit = 100 } = req.query;
+    const links = await getTopClusterLinks({ limit: parseInt(limit) });
+    res.json({ links });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ===============================================
 // STARTUP
 // ===============================================
 
@@ -342,7 +413,8 @@ async function startup() {
   console.log('');
   console.log('╔════════════════════════════════════════════════╗');
   console.log('║     ARIA - ADAPTIVE RESONANCE INTELLIGENCE     ║');
-  console.log('║         Pure Word Graph Response System        ║');
+  console.log('║       Pure Word Graph Response System          ║');
+  console.log('║     + Cluster Links for Sentence Flow          ║');
   console.log('╚════════════════════════════════════════════════╝');
   console.log('');
 
@@ -376,16 +448,29 @@ async function startup() {
     console.log('✅ Bot integration ready');
   }
   
+  // Check cluster links table
+  const { error: clusterError } = await supabase
+    .from('aria_cluster_links')
+    .select('id')
+    .limit(1);
+  
+  if (clusterError && clusterError.message.includes('does not exist')) {
+    console.log('⚠️  aria_cluster_links table not found - run migration 002_aria_cluster_links.sql');
+  } else {
+    console.log('✅ Cluster links ready');
+  }
+  
   // Show memory stats
   try {
     const stats = await getMemoryStats();
     console.log('');
     console.log('📊 Memory State:');
-    console.log(`   Short-term:  ${stats.tiers.short} correlations`);
-    console.log(`   Medium-term: ${stats.tiers.medium} correlations`);
-    console.log(`   Long-term:   ${stats.tiers.long} correlations`);
-    console.log(`   Phrases:     ${stats.phrases} phrases`);
-    console.log(`   Messages:    ${stats.messagesProcessed} processed`);
+    console.log(`   Short-term:    ${stats.tiers.short} correlations`);
+    console.log(`   Medium-term:   ${stats.tiers.medium} correlations`);
+    console.log(`   Long-term:     ${stats.tiers.long} correlations`);
+    console.log(`   Phrases:       ${stats.phrases} phrases`);
+    console.log(`   Cluster Links: ${stats.clusterLinks || 0} links`);
+    console.log(`   Messages:      ${stats.messagesProcessed} processed`);
   } catch (e) {
     console.log('⚠️  Memory tables not found - run migration 001_aria_tables.sql');
   }
@@ -403,6 +488,12 @@ async function startup() {
     console.log(`   Mentions: ${ARIA.triggers.mentions.join(', ')}`);
     console.log(`   Commands: ${ARIA.triggers.commands.join(', ')}`);
     console.log(`   Questions: ${ARIA.triggers.questions ? 'Yes (30% chance)' : 'No'}`);
+    console.log('');
+    console.log('New Cluster Link Endpoints:');
+    console.log('   GET /api/clusters/links/:cluster - Get outgoing links');
+    console.log('   GET /api/clusters/neighbors/:cluster - Get all neighbors');
+    console.log('   GET /api/clusters/search?q=word - Search clusters');
+    console.log('   GET /api/clusters/top - Get top cluster links');
     console.log('');
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     console.log(`✨ ${ARIA.name} is online and listening...`);

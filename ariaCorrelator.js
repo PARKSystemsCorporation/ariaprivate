@@ -2,6 +2,7 @@
 // ARIA - Pure word correlation
 // NO POS, NO GRAMMAR, NO SENTENCES
 // Words → Correlations → Phrases → Concepts
+// NEW: Cluster-to-Cluster links for sentence flow
 
 import 'dotenv/config';
 import { createClient } from '@supabase/supabase-js';
@@ -28,6 +29,16 @@ const DECAY_CONFIG = {
   long: { interval: 1000, rate: 0.01 }
 };
 
+// NEW: Cluster link configuration
+const CLUSTER_LINK_CONFIG = {
+  windowSize: 3,           // Link clusters within this distance
+  baseScore: 0.02,         // Base score for new links
+  adjacentBonus: 0.03,     // Extra score for adjacent clusters
+  reinforceAmount: 0.015,  // Score added on reinforcement
+  decayInterval: 100,      // Messages between decay checks
+  decayRate: 0.10          // Decay rate per interval
+};
+
 // ===============================================
 // TOKENIZATION - Pure word extraction
 // ===============================================
@@ -45,6 +56,53 @@ function tokenizeMessage(text) {
     word,
     position: index
   }));
+}
+
+// ===============================================
+// NEW: CLUSTER EXTRACTION
+// Extract 1-3 word clusters from message
+// ===============================================
+function extractClusters(tokens) {
+  const clusters = [];
+  const words = tokens.map(t => t.word);
+  
+  if (words.length === 0) return clusters;
+  
+  let position = 0;
+  
+  // Extract 1-word clusters
+  for (let i = 0; i < words.length; i++) {
+    clusters.push({
+      words: [words[i]],
+      key: words[i],
+      position: position++,
+      size: 1
+    });
+  }
+  
+  // Extract 2-word clusters
+  for (let i = 0; i < words.length - 1; i++) {
+    const cluster = [words[i], words[i + 1]];
+    clusters.push({
+      words: cluster,
+      key: cluster.join('_'),
+      position: position++,
+      size: 2
+    });
+  }
+  
+  // Extract 3-word clusters
+  for (let i = 0; i < words.length - 2; i++) {
+    const cluster = [words[i], words[i + 1], words[i + 2]];
+    clusters.push({
+      words: cluster,
+      key: cluster.join('_'),
+      position: position++,
+      size: 3
+    });
+  }
+  
+  return clusters;
 }
 
 // ===============================================
@@ -449,6 +507,244 @@ async function buildPhrases(messageIndex) {
 }
 
 // ===============================================
+// NEW STEP: CLUSTER EXTRACTION & STORAGE
+// ===============================================
+async function extractAndStoreClusters(messageText, messageId, userId, messageIndex) {
+  console.log('\n🧩 Extracting clusters...');
+  
+  const tokens = tokenizeMessage(messageText);
+  const clusters = extractClusters(tokens);
+  
+  if (clusters.length === 0) {
+    console.log('   No clusters extracted');
+    return [];
+  }
+  
+  // Store clusters for this message
+  const clusterRecords = clusters.map(c => ({
+    id: uuidv4(),
+    cluster_key: c.key,
+    words: c.words,
+    position: c.position,
+    message_index: messageIndex,
+    message_id: messageId,
+    user_id: userId
+  }));
+  
+  const { error } = await supabase
+    .from('aria_clusters')
+    .insert(clusterRecords);
+  
+  if (error) {
+    // Table might not exist yet - that's OK
+    if (!error.message.includes('does not exist')) {
+      console.error('   ❌ Cluster storage error:', error.message);
+    }
+    return clusters; // Return clusters anyway for linking
+  }
+  
+  console.log(`   🧩 ${clusters.length} clusters extracted`);
+  return clusters;
+}
+
+// ===============================================
+// NEW STEP: BUILD CLUSTER LINKS
+// Creates connections between clusters
+// ===============================================
+async function buildClusterLinks(clusters, messageIndex) {
+  console.log('\n🔗 Building cluster links...');
+  
+  if (clusters.length < 2) {
+    console.log('   Not enough clusters for linking');
+    return { newLinks: 0, reinforced: 0 };
+  }
+  
+  let newLinks = 0;
+  let reinforcedLinks = 0;
+  const processedPairs = new Set();
+  
+  // Sort clusters by their original position in the message
+  // For multi-word clusters, use average position
+  const sortedClusters = [...clusters].sort((a, b) => {
+    // Single words have clearer positions
+    // Multi-word clusters: use first word position
+    return a.position - b.position;
+  });
+  
+  // Create links between clusters within window
+  for (let i = 0; i < sortedClusters.length; i++) {
+    for (let j = i + 1; j < sortedClusters.length && j <= i + CLUSTER_LINK_CONFIG.windowSize; j++) {
+      const clusterA = sortedClusters[i];
+      const clusterB = sortedClusters[j];
+      
+      // Skip identical clusters
+      if (clusterA.key === clusterB.key) continue;
+      
+      // Skip if already processed this pair
+      const pairKey = `${clusterA.key}|${clusterB.key}`;
+      const reversePairKey = `${clusterB.key}|${clusterA.key}`;
+      if (processedPairs.has(pairKey) || processedPairs.has(reversePairKey)) continue;
+      processedPairs.add(pairKey);
+      
+      const distance = j - i;
+      
+      // Calculate link score based on distance
+      let linkScore = CLUSTER_LINK_CONFIG.baseScore;
+      if (distance === 1) {
+        linkScore += CLUSTER_LINK_CONFIG.adjacentBonus;
+      } else if (distance === 2) {
+        linkScore += CLUSTER_LINK_CONFIG.adjacentBonus * 0.5;
+      }
+      
+      // Create FORWARD link (A → B)
+      const forwardResult = await upsertClusterLink(
+        clusterA.key,
+        clusterB.key,
+        'forward',
+        linkScore,
+        messageIndex
+      );
+      
+      if (forwardResult.isNew) {
+        newLinks++;
+        console.log(`   🔗 ${clusterA.key} → ${clusterB.key} (${linkScore.toFixed(3)})`);
+      } else if (forwardResult.reinforced) {
+        reinforcedLinks++;
+      }
+      
+      // Create BIDIRECTIONAL link (for semantic association)
+      const biResult = await upsertClusterLink(
+        clusterB.key,
+        clusterA.key,
+        'bidirectional',
+        linkScore * 0.5, // Lower score for reverse direction
+        messageIndex
+      );
+      
+      if (biResult.isNew) {
+        newLinks++;
+      } else if (biResult.reinforced) {
+        reinforcedLinks++;
+      }
+    }
+  }
+  
+  console.log(`   ✅ ${newLinks} new links, ${reinforcedLinks} reinforced`);
+  return { newLinks, reinforced: reinforcedLinks };
+}
+
+// ===============================================
+// UPSERT CLUSTER LINK
+// ===============================================
+async function upsertClusterLink(fromCluster, toCluster, direction, addScore, messageIndex) {
+  // Check if link exists
+  const { data: existing, error: findError } = await supabase
+    .from('aria_cluster_links')
+    .select('*')
+    .eq('from_cluster', fromCluster)
+    .eq('to_cluster', toCluster)
+    .single();
+  
+  if (findError && !findError.message.includes('does not exist') && 
+      !findError.message.includes('No rows found') &&
+      !findError.message.includes('JSON object requested')) {
+    // Table might not exist - skip silently
+    return { isNew: false, reinforced: false };
+  }
+  
+  if (existing) {
+    // REINFORCE existing link
+    const newScore = Math.min(1.0, existing.score + CLUSTER_LINK_CONFIG.reinforceAmount);
+    
+    await supabase
+      .from('aria_cluster_links')
+      .update({
+        score: newScore,
+        reinforcement_count: existing.reinforcement_count + 1,
+        last_seen_message_index: messageIndex,
+        decay_at_message: messageIndex + CLUSTER_LINK_CONFIG.decayInterval,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', existing.id);
+    
+    return { isNew: false, reinforced: true };
+    
+  } else {
+    // CREATE new link
+    const newLink = {
+      id: uuidv4(),
+      from_cluster: fromCluster,
+      to_cluster: toCluster,
+      direction: direction,
+      score: addScore,
+      reinforcement_count: 1,
+      decay_count: 0,
+      decay_at_message: messageIndex + CLUSTER_LINK_CONFIG.decayInterval,
+      last_seen_message_index: messageIndex
+    };
+    
+    const { error: insertError } = await supabase
+      .from('aria_cluster_links')
+      .insert(newLink);
+    
+    if (insertError) {
+      // Table might not exist
+      if (!insertError.message.includes('does not exist')) {
+        console.error('   ❌ Link insert error:', insertError.message);
+      }
+      return { isNew: false, reinforced: false };
+    }
+    
+    return { isNew: true, reinforced: false };
+  }
+}
+
+// ===============================================
+// NEW: DECAY CLUSTER LINKS
+// ===============================================
+async function decayClusterLinks(currentMessageIndex) {
+  const { data: dueForDecay, error } = await supabase
+    .from('aria_cluster_links')
+    .select('*')
+    .lte('decay_at_message', currentMessageIndex);
+  
+  if (error || !dueForDecay || dueForDecay.length === 0) return 0;
+  
+  let decayedCount = 0;
+  let removedCount = 0;
+  
+  for (const link of dueForDecay) {
+    const newScore = link.score * (1 - CLUSTER_LINK_CONFIG.decayRate);
+    
+    if (newScore < 0.005) {
+      // Remove very weak links
+      await supabase
+        .from('aria_cluster_links')
+        .delete()
+        .eq('id', link.id);
+      removedCount++;
+    } else {
+      // Decay the link
+      await supabase
+        .from('aria_cluster_links')
+        .update({
+          score: newScore,
+          decay_count: (link.decay_count || 0) + 1,
+          decay_at_message: currentMessageIndex + CLUSTER_LINK_CONFIG.decayInterval
+        })
+        .eq('id', link.id);
+      decayedCount++;
+    }
+  }
+  
+  if (decayedCount + removedCount > 0) {
+    console.log(`   📉 Cluster links: ${decayedCount} decayed, ${removedCount} removed`);
+  }
+  
+  return decayedCount + removedCount;
+}
+
+// ===============================================
 // STEP 4: DECAY CHECK
 // ===============================================
 async function checkDecay(currentMessageIndex) {
@@ -516,6 +812,9 @@ async function checkDecay(currentMessageIndex) {
     }
   }
   
+  // NEW: Also decay cluster links
+  await decayClusterLinks(currentMessageIndex);
+  
   if (totalDecayed + totalDemoted + totalToGraveyard > 0) {
     console.log(`   📉 Decay: ${totalDecayed} decayed, ${totalDemoted} demoted, ${totalToGraveyard} buried`);
   }
@@ -544,9 +843,15 @@ export async function processMessage(messageText, messageId, userId) {
   
   const corrResult = await runCorrelator(messageIndex);
   const newPhrases = await buildPhrases(messageIndex);
+  
+  // NEW: Extract clusters and build cluster links
+  const clusters = await extractAndStoreClusters(messageText, messageId, userId, messageIndex);
+  const clusterLinkResult = await buildClusterLinks(clusters, messageIndex);
+  
   const decayResult = await checkDecay(messageIndex);
   
   console.log(`\n📊 ${words.length} words, ${corrResult.newCorrelations} new, ${corrResult.reinforced} reinforced`);
+  console.log(`   🔗 ${clusterLinkResult.newLinks} new cluster links, ${clusterLinkResult.reinforced} reinforced`);
   
   return {
     processed: true,
@@ -554,6 +859,7 @@ export async function processMessage(messageText, messageId, userId) {
     wordsProcessed: words.length,
     ...corrResult,
     newPhrases,
+    clusterLinks: clusterLinkResult,
     ...decayResult
   };
 }
@@ -618,6 +924,134 @@ export async function searchByWord(word) {
   return results;
 }
 
+// ===============================================
+// NEW: CLUSTER LINK QUERY FUNCTIONS
+// ===============================================
+
+// Get outgoing links from a cluster
+export async function getClusterLinks(clusterKey, options = {}) {
+  const { limit = 20, minScore = 0.01 } = options;
+  
+  const { data: outgoing, error } = await supabase
+    .from('aria_cluster_links')
+    .select('*')
+    .eq('from_cluster', clusterKey)
+    .gte('score', minScore)
+    .order('score', { ascending: false })
+    .limit(limit);
+  
+  if (error) {
+    // Table might not exist
+    return [];
+  }
+  
+  return outgoing || [];
+}
+
+// Get all links involving a cluster (both directions)
+export async function getClusterNeighbors(clusterKey, options = {}) {
+  const { limit = 30, minScore = 0.01 } = options;
+  
+  const { data: outgoing } = await supabase
+    .from('aria_cluster_links')
+    .select('*')
+    .eq('from_cluster', clusterKey)
+    .gte('score', minScore)
+    .order('score', { ascending: false })
+    .limit(limit);
+  
+  const { data: incoming } = await supabase
+    .from('aria_cluster_links')
+    .select('*')
+    .eq('to_cluster', clusterKey)
+    .gte('score', minScore)
+    .order('score', { ascending: false })
+    .limit(limit);
+  
+  return {
+    outgoing: outgoing || [],
+    incoming: incoming || []
+  };
+}
+
+// Search for clusters containing a word
+export async function searchClustersByWord(word, options = {}) {
+  const { limit = 50 } = options;
+  const normalized = word.toLowerCase();
+  
+  // Get all cluster links where from_cluster or to_cluster contains the word
+  const { data: fromLinks } = await supabase
+    .from('aria_cluster_links')
+    .select('*')
+    .ilike('from_cluster', `%${normalized}%`)
+    .order('score', { ascending: false })
+    .limit(limit);
+  
+  const { data: toLinks } = await supabase
+    .from('aria_cluster_links')
+    .select('*')
+    .ilike('to_cluster', `%${normalized}%`)
+    .order('score', { ascending: false })
+    .limit(limit);
+  
+  // Collect unique clusters
+  const clusters = new Map();
+  
+  for (const link of [...(fromLinks || []), ...(toLinks || [])]) {
+    if (link.from_cluster.includes(normalized)) {
+      if (!clusters.has(link.from_cluster) || clusters.get(link.from_cluster).score < link.score) {
+        clusters.set(link.from_cluster, { key: link.from_cluster, score: link.score });
+      }
+    }
+    if (link.to_cluster.includes(normalized)) {
+      if (!clusters.has(link.to_cluster) || clusters.get(link.to_cluster).score < link.score) {
+        clusters.set(link.to_cluster, { key: link.to_cluster, score: link.score });
+      }
+    }
+  }
+  
+  return Array.from(clusters.values()).sort((a, b) => b.score - a.score);
+}
+
+// Get top cluster links overall
+export async function getTopClusterLinks(options = {}) {
+  const { limit = 100 } = options;
+  
+  const { data, error } = await supabase
+    .from('aria_cluster_links')
+    .select('*')
+    .order('score', { ascending: false })
+    .limit(limit);
+  
+  if (error) return [];
+  return data || [];
+}
+
+// Get cluster link stats
+export async function getClusterLinkStats() {
+  const { count: totalLinks } = await supabase
+    .from('aria_cluster_links')
+    .select('*', { count: 'exact', head: true });
+  
+  const { data: topLinks } = await supabase
+    .from('aria_cluster_links')
+    .select('score')
+    .order('score', { ascending: false })
+    .limit(10);
+  
+  const avgScore = topLinks && topLinks.length > 0 
+    ? topLinks.reduce((sum, l) => sum + l.score, 0) / topLinks.length 
+    : 0;
+  
+  return {
+    totalLinks: totalLinks || 0,
+    avgTopScore: avgScore
+  };
+}
+
+// ===============================================
+// MEMORY STATS (updated to include cluster links)
+// ===============================================
 export async function getMemoryStats() {
   const { count: shortCount } = await supabase
     .from('aria_short')
@@ -645,6 +1079,9 @@ export async function getMemoryStats() {
     .eq('id', 1)
     .single();
   
+  // NEW: Get cluster link stats
+  const clusterStats = await getClusterLinkStats();
+  
   return {
     tiers: {
       short: shortCount || 0,
@@ -653,6 +1090,7 @@ export async function getMemoryStats() {
     },
     decay: decayCount || 0,
     phrases: phraseCount || 0,
+    clusterLinks: clusterStats.totalLinks,
     messagesProcessed: counter?.current_index || 0
   };
 }
@@ -661,5 +1099,11 @@ export default {
   processMessage,
   getMemoryContext,
   searchByWord,
-  getMemoryStats
+  getMemoryStats,
+  // NEW exports for cluster links
+  getClusterLinks,
+  getClusterNeighbors,
+  searchClustersByWord,
+  getTopClusterLinks,
+  getClusterLinkStats
 };

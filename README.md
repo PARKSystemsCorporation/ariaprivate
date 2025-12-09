@@ -1,158 +1,185 @@
 # ARIA - Adaptive Resonance Intelligence Architecture
 
-A pure word graph response system for GARI. Unlike KIRA which uses LLMs, ARIA generates responses by walking word correlation graphs built from chat messages.
+## Emergent Linguistic System v2.0
 
-## NEW: Cluster-to-Cluster Links
+ARIA is a **pure emergent linguistic system** that learns language patterns through statistical behavior analysis, NOT through templates or LLMs. Words are categorized based on how they behave, and responses emerge from overlapping two-word pairs.
 
-ARIA now includes **second-order correlations** - connections between clusters that enable coherent multi-step sequences instead of random word fragments.
+## Core Principles
 
-### Before (Word-only)
-```
-Input: "What's the weather like?"
-Output: "you me did something weather"  ❌ Incoherent babbling
-```
+1. **ARIA is NOT an LLM** - It learns ONLY through correlations and memory
+2. **Categories emerge from behavior** - Not from meaning or grammar
+3. **ONLY two-word pairs** - Longer phrases emerge from overlapping pairs
+4. **No stopword removal** - Every word contributes to the pattern
 
-### After (With Cluster Links)
-```
-Input: "What's the weather like?"
-Output: "the weather is beautiful today sunny"  ✅ Coherent sequence
-```
+## Four Emergent Categories
+
+Categories are assigned based on statistical patterns, not semantic meaning:
+
+| Category | Behavior | Analogy |
+|----------|----------|---------|
+| **stable** | Persistent anchors, appear in many contexts | Noun-like |
+| **transition** | Connect ideas, signal change/motion | Verb-like |
+| **modifier** | Appear adjacent to stable words, show contrast | Adjective-like |
+| **structural** | High frequency, low uniqueness, sentence glue | Function words |
 
 ## How It Works
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                      USER MESSAGES                               │
+│                      USER MESSAGE                                │
 │  "The weather is beautiful today"                                │
 └────────────────────────────┬────────────────────────────────────┘
                              │
                              ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                      TOKENIZER                                   │
+│                      TOKENIZATION                                │
 │  [the] [weather] [is] [beautiful] [today]                       │
-│  (pure words, no POS tagging, no stopword removal)              │
+│  (lowercase, no stopword removal)                               │
 └────────────────────────────┬────────────────────────────────────┘
                              │
                              ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                   CLUSTER EXTRACTION (NEW)                       │
-│  1-word: [the] [weather] [is] [beautiful] [today]               │
-│  2-word: [the_weather] [weather_is] [is_beautiful] [beautiful_today] │
-│  3-word: [the_weather_is] [weather_is_beautiful] [is_beautiful_today] │
+│                   TOKEN STATISTICS                               │
+│  For each token, update:                                        │
+│  • total_occurrences += 1                                       │
+│  • context_count (unique messages)                              │
+│  • unique_adjacency_count (±2 window)                           │
+│  • positional_variance                                          │
+│  • bridge_count (between stable tokens)                         │
+│  • temporal_adj_count (near temporal markers)                   │
+│  • adjacent_to_stable                                           │
+│  • contrast_pair_count                                          │
 └────────────────────────────┬────────────────────────────────────┘
                              │
                              ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                   PAIR EXTRACTION                                │
-│  weather↔beautiful, weather↔today, beautiful↔today              │
-│  (all pairs scored by proximity)                                │
+│                   SCORE CALCULATION                              │
+│                                                                  │
+│  StabilityScore = context_ratio + adj_ratio - variance_ratio    │
+│  TransitionScore = bridge_ratio + temporal_ratio + variance     │
+│  DependencyScore = stable_adj - standalone_ratio + contrast     │
+│  StructuralScore = frequency - adj_ratio - standalone - var     │
+│                                                                  │
+│  All scores clamped to [0, 1]                                   │
 └────────────────────────────┬────────────────────────────────────┘
                              │
                              ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                   CLUSTER LINKING (NEW)                          │
-│  weather → weather_is (0.05)                                    │
-│  weather_is → is_beautiful (0.05)                               │
-│  is_beautiful → beautiful_today (0.05)                          │
-│  (directional links between adjacent clusters)                  │
+│                   CATEGORY ASSIGNMENT                            │
+│  if occurrences >= 5:                                           │
+│    category = max_score category if max_score > 0.5             │
+│  else:                                                          │
+│    category = 'unclassified'                                    │
 └────────────────────────────┬────────────────────────────────────┘
                              │
                              ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                   TIER STORAGE                                   │
-│  aria_short  (0-30%):   Fast decay, new correlations            │
-│  aria_medium (30-80%):  Medium decay, reinforced correlations   │
-│  aria_long   (80%+):    Slow decay, strong memories             │
-│  aria_cluster_links:    Cluster-to-cluster connections (NEW)    │
+│                   TWO-WORD PAIRS                                 │
+│  ONLY adjacent tokens form pairs:                               │
+│  [the_weather] [weather_is] [is_beautiful] [beautiful_today]    │
+│                                                                  │
+│  Each pair tracks:                                              │
+│  • frequency                                                    │
+│  • strength (0-1, affected by reinforcement/decay)              │
+│  • category_pattern (e.g., "structural->stable")                │
+│  • tier (short/medium/long/decay)                               │
 └────────────────────────────┬────────────────────────────────────┘
                              │
                              ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                   RESPONSE GENERATION                            │
-│  1. Build cluster graph from links                               │
-│  2. Find starting cluster from input keywords                    │
-│  3. Walk cluster graph following highest-weighted links          │
-│  4. Merge cluster sequence into coherent text                    │
-│  5. Fall back to word graph if needed                           │
-│  ⚠️ NO LLM - Pure graph walking                                 │
+│                   EMERGENT PHRASES                               │
+│  Longer phrases emerge from OVERLAPPING pairs:                  │
+│                                                                  │
+│  If pair1 = (A, B) and pair2 = (B, C):                         │
+│    emergent_phrase = A + B + C                                  │
+│                                                                  │
+│  Example: weather_is + is_beautiful = "weather is beautiful"    │
+│  ⚠️ NOT stored - discovered at query time                       │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-## Cluster Link System
+## Score Calculation Formulas
 
-### How Cluster Links Work
-
-When a message is processed:
-1. Extract all 1-word, 2-word, and 3-word clusters
-2. Create **directional links** between adjacent clusters (window size 2-3)
-3. Reinforce existing links when patterns repeat
-
-Example from "The weather is beautiful today":
+### StabilityScore
 ```
-Clusters: [the, weather, is, beautiful, today, the_weather, weather_is, ...]
-
-Links created:
-  the → weather (forward)
-  weather → the (bidirectional, lower weight)
-  the → the_weather (forward)
-  the_weather → weather_is (forward)
-  weather_is → is_beautiful (forward)
-  ...
+StabilityScore = (context_count / totalContextsSeen)
+               + (unique_adjacency_count / totalAdjWindows)
+               - (positional_variance / maxVariance)
 ```
 
-### Link Scoring
+### TransitionScore
+```
+TransitionScore = (bridge_count / total_occurrences)
+                + (temporal_adj_count / total_occurrences)
+                + (positional_variance / maxVariance)
+```
 
-| Condition | Score Added |
-|-----------|-------------|
-| Adjacent clusters (distance 1) | +0.05 |
-| Distance 2 | +0.035 |
-| Distance 3 | +0.02 |
-| Reinforcement | +0.015 |
+### DependencyScore (Modifier)
+```
+DependencyScore = (adjacent_to_stable / total_occurrences)
+                + (contrast_pair_count / total_occurrences)
+                - (standalone_count / total_occurrences)
+```
 
-### Response Generation with Clusters
+### StructuralScore
+```
+StructuralScore = (total_occurrences / totalContextsSeen)
+                + (temporal_adj_count / total_occurrences)
+                - (unique_adjacency_count / totalAdjWindows)
+                - (standalone_count / total_occurrences)
+                - (positional_variance / maxVariance)
+```
 
-1. **Extract input clusters** from user message
-2. **Build cluster graph** from stored links
-3. **Find best starting cluster** (matching input keywords)
-4. **Walk the graph** following highest-weighted outgoing links
-5. **Merge clusters** into text, removing overlapping words
-6. **Fall back to word graph** if cluster path is too short
+## Memory Tier System
 
-## Key Differences from KIRA
+| Tier | Score Range | Decay Rate | Decay Interval | Description |
+|------|-------------|------------|----------------|-------------|
+| SHORT | 0% - 30% | 15% | 50 messages | New correlations |
+| MEDIUM | 30% - 80% | 5% | 200 messages | Reinforced patterns |
+| LONG | 80%+ | 1% | 1000 messages | Strong memories |
+| DECAY | < 1% | N/A | N/A | Graveyard |
 
-| Feature | KIRA | ARIA |
-|---------|------|------|
-| Response Generation | LLM (Groq/Ollama) | Graph Walking |
-| Word Processing | POS Tagging | Pure Tokens |
-| Stopword Removal | Yes | No |
-| Grammar Awareness | Yes | No |
-| Sequence Learning | No | Yes (Cluster Links) |
-| Output Style | Natural sentences | Word associations → Sequences |
-| Dependencies | LLM API | None |
+### Promotion Rules by Category
+- **stable** → 1.5x faster promotion
+- **structural** → 0.6x slower promotion
+- **transition/modifier** → Normal rate
+- **unclassified** → 0.8x slightly slower
 
-## Tier System
+## Database Schema
 
-| Tier | Score Threshold | Decay Rate | Decay Interval |
-|------|-----------------|------------|----------------|
-| SHORT | 0% - 30% | 15% | Every 50 messages |
-| MEDIUM | 30% - 80% | 5% | Every 200 messages |
-| LONG | 80%+ | 1% | Every 1000 messages |
-| CLUSTER_LINKS | N/A | 10% | Every 100 messages |
+### aria_token_stats
+```sql
+token                    text UNIQUE NOT NULL
+total_occurrences        integer
+context_count            integer
+unique_adjacency_count   integer
+positional_variance      float
+bridge_count             integer
+temporal_adj_count       integer
+adjacent_to_stable       integer
+contrast_pair_count      integer
+standalone_count         integer
+stability_score          float
+transition_score         float
+dependency_score         float
+structural_score         float
+category                 text (stable|transition|modifier|structural|unclassified)
+```
 
-## Database Tables
-
-All tables are prefixed with `aria_` to stay separate from KIRA:
-
-- `aria_purgatory` - Temporary word storage
-- `aria_short` - Short-term correlations
-- `aria_medium` - Medium-term correlations
-- `aria_long` - Long-term correlations
-- `aria_phrases` - Multi-word associations
-- `aria_cluster_links` - **NEW: Cluster-to-cluster connections**
-- `aria_clusters` - **NEW: Extracted clusters per message**
-- `aria_decay` - Graveyard for forgotten correlations
-- `aria_messages` - Chat message history
-- `aria_message_counter` - Global message index
+### aria_word_pairs
+```sql
+pattern_key              text UNIQUE NOT NULL
+token_a                  text NOT NULL
+token_b                  text NOT NULL
+frequency                integer
+strength                 float
+category_pattern         text (e.g., "stable->transition")
+tier                     text (short|medium|long|decay)
+reinforcement_count      integer
+decay_count              integer
+decay_at_message         integer
+last_seen_message_index  integer
+```
 
 ## Installation
 
@@ -172,90 +199,86 @@ cp .env.example .env
 3. **Run migrations:**
    - Go to Supabase SQL Editor
    - Run `migrations/001_aria_tables.sql`
-   - Run `migrations/002_aria_cluster_links.sql` (NEW)
+   - Run `migrations/003_aria_token_stats.sql`
 
 4. **Start:**
 ```bash
 npm start
 ```
 
-## Deployment on Railway
-
-1. Create new Railway project
-2. Connect to your GitHub repo
-3. Set environment variables:
-   - `SUPABASE_URL`
-   - `SUPABASE_ANON_KEY`
-   - `SUPABASE_SERVICE_ROLE_KEY`
-4. Deploy automatically detects Dockerfile
-
 ## API Endpoints
 
-### Existing Endpoints
-
+### Core
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | Health check |
-| `/api/memory/stats` | GET | Memory statistics (now includes cluster links) |
-| `/api/memory/search?q=word` | GET | Search correlations |
-| `/api/memory/context` | GET | Full memory context |
-| `/api/chat` | POST | Generate ARIA response |
-| `/api/aria` | GET | ARIA configuration |
-| `/api/aria/respond` | POST | Force ARIA response |
+| `/api/aria` | GET | ARIA info and configuration |
 
-### NEW Cluster Link Endpoints
-
+### Memory
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/clusters/links/:cluster` | GET | Get outgoing links from a cluster |
-| `/api/clusters/neighbors/:cluster` | GET | Get all neighbors (in + out) |
-| `/api/clusters/search?q=word` | GET | Search clusters by word |
-| `/api/clusters/top` | GET | Get top cluster links |
+| `/api/memory/stats` | GET | Memory statistics |
+| `/api/memory/search?q=word` | GET | Search memory |
+| `/api/memory/context` | GET | Full memory context |
 
-## Usage
+### Token Statistics
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/tokens/:token` | GET | Get token statistics |
+| `/api/tokens/category/:cat` | GET | Get tokens by category |
+| `/api/categories` | GET | Analyze all categories |
 
-### Chat Interface
-Access at `thisisgari.com/aria.html`
+### Word Pairs
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/pairs` | GET | Get top pairs |
+| `/api/pairs/search?q=word` | GET | Search pairs by word |
 
-### API Chat
-```bash
-curl -X POST https://your-railway-url/api/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message": "What do you know about weather?"}'
+### Emergent Phrases
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/chains/:word` | GET | Get emergent chains from word |
+
+### Chat
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/chat` | POST | Chat with ARIA |
+| `/api/aria/respond` | POST | Force ARIA response |
+
+## Response Generation
+
+ARIA generates responses through multiple methods:
+
+1. **Emergent Phrase Discovery** - Find overlapping pairs to build phrases
+2. **Category-Aware Graph Walking** - Walk pairs respecting category transitions
+3. **Category Composition** - Build responses from category combinations
+4. **Raw Pair Fallback** - Use strongest pairs directly
+
+### Category Transitions
+The system prefers certain category sequences:
+- `stable` → `modifier`, `transition`, `structural`
+- `modifier` → `stable`, `structural`
+- `transition` → `stable`, `modifier`, `structural`
+- `structural` → `stable`, `modifier`, `transition`
+
+## Example Response Generation
+
 ```
+Input: "What about the weather?"
+Keywords: [weather]
 
-### Search Memory
-```bash
-curl https://your-railway-url/api/memory/search?q=weather
-```
+Step 1: Search pairs containing "weather"
+  Found: weather_is (0.15), beautiful_weather (0.12), weather_today (0.08)
 
-### View Cluster Links
-```bash
-curl https://your-railway-url/api/clusters/links/weather
-curl https://your-railway-url/api/clusters/top
-```
+Step 2: Build emergent chains
+  weather → is → beautiful
+  weather → today
+  beautiful → weather → is
 
-## How ARIA Generates Responses (Updated)
+Step 3: Category-aware selection
+  "weather" (stable) + "is" (structural) + "beautiful" (modifier)
 
-1. **Extract keywords AND clusters** from user input
-2. **Build cluster graph** from stored cluster links
-3. **Find best starting cluster** matching input
-4. **Walk cluster graph** following highest-weighted links
-5. **Merge cluster path** into coherent text
-6. **Fall back to word graph** if cluster path too short
-7. **Return response**
-
-Example:
-```
-Input: "What's the weather like?"
-Keywords: [weather, like]
-Input clusters: [weather, like, weather_like, ...]
-
-Cluster graph walk from "weather":
-  weather → weather_is → is_beautiful → beautiful_today
-
-Merged output: "weather is beautiful today"
-Response: "weather is beautiful today"
+Output: "weather is beautiful today"
 ```
 
 ## Files
@@ -263,17 +286,16 @@ Response: "weather is beautiful today"
 ```
 aria-system/
 ├── server.js              # Main entry point + API
-├── ariaCorrelator.js      # Correlation engine + cluster links
-├── ariaGenerator.js       # Response generation (cluster + word graph)
-├── aria.html              # Chat interface
+├── ariaCorrelator.js      # Token stats + pair correlation engine
+├── ariaGenerator.js       # Emergent response generation
 ├── package.json
 ├── Dockerfile
 ├── railway.json
 ├── .env.example
 ├── migrations/
 │   ├── 001_aria_tables.sql
-│   └── 002_aria_cluster_links.sql   # NEW
-├── test.js                # Tests including cluster links
+│   └── 003_aria_token_stats.sql
+├── test.js
 └── README.md
 ```
 
@@ -286,34 +308,6 @@ aria-system/
 | `SUPABASE_SERVICE_ROLE_KEY` | Supabase service role key | Yes |
 | `PORT` | HTTP server port | No (default: 3002) |
 
-## Configuration
-
-### Cluster Link Config (in ariaCorrelator.js)
-
-```javascript
-const CLUSTER_LINK_CONFIG = {
-  windowSize: 3,           // Link clusters within this distance
-  baseScore: 0.02,         // Base score for new links
-  adjacentBonus: 0.03,     // Extra score for adjacent clusters
-  reinforceAmount: 0.015,  // Score added on reinforcement
-  decayInterval: 100,      // Messages between decay checks
-  decayRate: 0.10          // Decay rate per interval
-};
-```
-
-### Generation Config (in ariaGenerator.js)
-
-```javascript
-const GENERATION_CONFIG = {
-  maxClusters: 8,           // Max clusters in a response
-  minClusters: 2,           // Min clusters for valid response
-  linkScoreThreshold: 0.01, // Minimum link score to follow
-  randomnessFactor: 0.3,    // Chance to pick non-top link
-  useClusterLinks: true,    // Enable cluster-based generation
-  fallbackToWordGraph: true // Fall back to word graph if no clusters
-};
-```
-
 ## Testing
 
 Run the test suite:
@@ -321,9 +315,32 @@ Run the test suite:
 npm test
 ```
 
-This includes tests for:
+Tests include:
 - Message processing
-- Word correlations
-- Cluster extraction
-- Cluster link creation/reinforcement
-- Response generation with cluster links
+- Token statistics
+- Category assignment
+- Word pair creation/reinforcement
+- Emergent phrase discovery
+- Response generation
+
+## Key Differences from Previous Version
+
+| Feature | v1.0 (Cluster Links) | v2.0 (Emergent Linguistic) |
+|---------|---------------------|---------------------------|
+| Word Categories | None | 4 emergent categories |
+| Pair Types | All word combinations | Adjacent pairs ONLY |
+| Phrase Storage | Explicit 3-word clusters | Emergent from overlap |
+| Category Learning | N/A | Statistical behavior |
+| Response Method | Cluster graph walking | Category-aware emergence |
+
+## Contributing
+
+ARIA is designed to be deterministic and simple. When contributing:
+- Do NOT add LLM integration
+- Do NOT add grammar rules
+- Do NOT remove stopwords
+- Keep the emergent philosophy
+
+## License
+
+MIT

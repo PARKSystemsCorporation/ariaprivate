@@ -1,14 +1,13 @@
 {
   "name": "gari-aria",
-  "version": "1.0.0",
-  "description": "ARIA - Adaptive Resonance Intelligence Architecture - Pure word graph response system",
+  "version": "2.0.0",
+  "description": "ARIA - Adaptive Resonance Intelligence Architecture - Emergent Linguistic System",
   "type": "module",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "correlator": "node ariaCorrelator.js",
     "test": "node test.js",
-    "migrate": "echo 'Run migrations/001_aria_tables.sql in Supabase SQL editor'"
+    "migrate": "echo 'Run migrations/001_aria_tables.sql and migrations/003_aria_token_stats.sql in Supabase SQL editor'"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",
@@ -21,5 +20,12 @@
   },
   "engines": {
     "node": ">=18.0.0"
-  }
+  },
+  "keywords": [
+    "ai",
+    "linguistics",
+    "emergent",
+    "word-graph",
+    "correlation"
+  ]
 }

@@ -1,19 +1,27 @@
 // ariaGenerator.js
-// ARIA - Pure word graph response generation
-// NO LLM, NO GRAMMAR, NO TEMPLATES
-// Just walks the word correlation graph
-// NEW: Uses cluster links for coherent multi-cluster sequences
+// =============================================
+// ARIA - EMERGENT RESPONSE GENERATION
+// =============================================
+// ARIA generates responses by:
+// 1. Finding relevant word pairs based on input
+// 2. Building emergent phrases from overlapping pairs
+// 3. Walking the pair graph with category-aware transitions
+// 4. NO LLM, NO TEMPLATES - Pure emergent behavior
+// =============================================
 
 import 'dotenv/config';
 import { createClient } from '@supabase/supabase-js';
-import { 
-  getMemoryContext, 
-  searchByWord, 
+import {
   getMemoryStats,
+  getMemoryContext,
+  searchByWord,
+  getTokenStats,
+  getTokensByCategory,
+  getTopPairs,
+  getEmergentChains,
   getClusterLinks,
-  getClusterNeighbors,
-  searchClustersByWord,
-  getTopClusterLinks
+  getTopClusterLinks,
+  searchClustersByWord
 } from './ariaCorrelator.js';
 
 const supabase = createClient(
@@ -24,18 +32,38 @@ const supabase = createClient(
 // ===============================================
 // CONFIGURATION
 // ===============================================
+
 const GENERATION_CONFIG = {
-  maxClusters: 8,           // Max clusters in a response
-  minClusters: 2,           // Min clusters for valid response
-  linkScoreThreshold: 0.01, // Minimum link score to follow
-  randomnessFactor: 0.3,    // Chance to pick non-top link
-  useClusterLinks: true,    // Enable cluster-based generation
-  fallbackToWordGraph: true // Fall back to word graph if no clusters
+  maxWords: 12,              // Maximum words in response
+  minWords: 3,               // Minimum words for valid response
+  maxAttempts: 10,           // Max graph walk attempts
+  strengthThreshold: 0.01,   // Minimum pair strength to follow
+  randomnessFactor: 0.25,    // Chance to pick non-top option
+  
+  // Category transition preferences
+  // What categories tend to follow what
+  categoryTransitions: {
+    stable: ['modifier', 'transition', 'structural'],
+    modifier: ['stable', 'structural'],
+    transition: ['stable', 'modifier', 'structural'],
+    structural: ['stable', 'modifier', 'transition'],
+    unclassified: ['stable', 'modifier', 'transition', 'structural']
+  },
+  
+  // Category weights for starting word selection
+  startingWeights: {
+    stable: 1.5,       // Prefer starting with stable (nouns)
+    transition: 1.0,   // Verbs OK
+    modifier: 0.7,     // Less likely to start with modifiers
+    structural: 0.3,   // Rarely start with structural words
+    unclassified: 0.5
+  }
 };
 
 // ===============================================
-// EXTRACT WORDS (no filtering)
+// TOKENIZATION
 // ===============================================
+
 function extractWords(text) {
   return text
     .toLowerCase()
@@ -45,490 +73,606 @@ function extractWords(text) {
 }
 
 // ===============================================
-// EXTRACT CLUSTERS FROM INPUT
+// BUILD WORD GRAPH FROM PAIRS
 // ===============================================
-function extractInputClusters(text) {
-  const words = extractWords(text);
-  const clusters = [];
-  
-  // Single words
-  for (const word of words) {
-    clusters.push({ key: word, words: [word], size: 1 });
-  }
-  
-  // Two-word clusters
-  for (let i = 0; i < words.length - 1; i++) {
-    const key = `${words[i]}_${words[i+1]}`;
-    clusters.push({ key, words: [words[i], words[i+1]], size: 2 });
-  }
-  
-  // Three-word clusters
-  for (let i = 0; i < words.length - 2; i++) {
-    const key = `${words[i]}_${words[i+1]}_${words[i+2]}`;
-    clusters.push({ key, words: [words[i], words[i+1], words[i+2]], size: 3 });
-  }
-  
-  return clusters;
-}
 
-// ===============================================
-// BUILD WORD GRAPH (existing logic)
-// ===============================================
-function buildWordGraph(correlations) {
+async function buildWordGraph(pairs) {
   const graph = new Map();
   
-  for (const corr of correlations) {
-    const { word1, word2, correlation_score } = corr;
-    if (!word1 || !word2) continue;
+  // FIX 2: Extract all unique tokens from pairs
+  const allTokens = new Set();
+  for (const pair of pairs) {
+    if (pair.token_a) allTokens.add(pair.token_a);
+    if (pair.token_b) allTokens.add(pair.token_b);
+  }
+  
+  // FIX 2: Batch-fetch all token stats with single Supabase query
+  const tokenArray = Array.from(allTokens);
+  const categoryMap = new Map();
+  
+  if (tokenArray.length > 0) {
+    const { data: tokenStats } = await supabase
+      .from('aria_token_stats')
+      .select('token, category')
+      .in('token', tokenArray);
     
-    const weight = correlation_score || 0.1;
+    if (tokenStats) {
+      for (const stat of tokenStats) {
+        categoryMap.set(stat.token, stat.category || 'unclassified');
+      }
+    }
+  }
+  
+  // FIX 2: Build graph without per-pair async calls
+  for (const pair of pairs) {
+    const { token_a, token_b, strength } = pair;
+    if (!token_a || !token_b) continue;
     
-    if (!graph.has(word1)) graph.set(word1, []);
-    if (!graph.has(word2)) graph.set(word2, []);
+    // Only include pairs above strength threshold
+    if (strength < GENERATION_CONFIG.strengthThreshold) continue;
     
-    graph.get(word1).push({ word: word2, weight });
-    graph.get(word2).push({ word: word1, weight });
+    // Get categories from batch-fetched map
+    const catA = categoryMap.get(token_a) || 'unclassified';
+    const catB = categoryMap.get(token_b) || 'unclassified';
+    
+    // Add edges in both directions
+    if (!graph.has(token_a)) {
+      graph.set(token_a, { edges: [], category: catA });
+    }
+    if (!graph.has(token_b)) {
+      graph.set(token_b, { edges: [], category: catB });
+    }
+    
+    graph.get(token_a).edges.push({
+      word: token_b,
+      weight: strength,
+      category: catB
+    });
+    
+    graph.get(token_b).edges.push({
+      word: token_a,
+      weight: strength,
+      category: catA
+    });
   }
   
   // Sort edges by weight
-  for (const [, edges] of graph) {
-    edges.sort((a, b) => b.weight - a.weight);
+  for (const [, node] of graph) {
+    node.edges.sort((a, b) => b.weight - a.weight);
   }
   
   return graph;
 }
 
 // ===============================================
-// WALK THE WORD GRAPH (existing logic)
+// CATEGORY-AWARE EDGE SELECTION
 // ===============================================
-function walkGraph(graph, startWord, maxLength = 8) {
-  if (!graph.has(startWord)) return [startWord];
+
+function selectNextWord(edges, currentCategory, visited, lastCategory) {
+  // Filter out visited words
+  const available = edges.filter(e => !visited.has(e.word));
+  
+  if (available.length === 0) return null;
+  
+  // Get preferred next categories
+  const preferredCategories = GENERATION_CONFIG.categoryTransitions[lastCategory] || 
+                               GENERATION_CONFIG.categoryTransitions.unclassified;
+  
+  // Score each available edge
+  const scored = available.map(edge => {
+    let score = edge.weight;
+    
+    // Boost if category is preferred transition
+    if (preferredCategories.includes(edge.category)) {
+      score *= 1.5;
+    }
+    
+    // Add randomness
+    score *= (1 + Math.random() * GENERATION_CONFIG.randomnessFactor);
+    
+    return { ...edge, score };
+  });
+  
+  // Sort by adjusted score
+  scored.sort((a, b) => b.score - a.score);
+  
+  // Usually pick the top, but sometimes pick second or third
+  const pickIndex = Math.random() < 0.7 ? 0 : 
+                    Math.random() < 0.8 ? Math.min(1, scored.length - 1) :
+                    Math.min(2, scored.length - 1);
+  
+  return scored[pickIndex];
+}
+
+// ===============================================
+// WALK THE WORD GRAPH
+// ===============================================
+
+async function walkGraph(graph, startWord, maxLength, keywords = [], retried = false, retrySet = null) {
+  // FIX 3: Initialize retrySet if not provided (persists through recursive fallback attempts)
+  if (!retrySet) {
+    retrySet = new Set();
+  }
+  
+  if (!graph.has(startWord)) {
+    // Dead-end recovery - try alternative start if not retried
+    if (!retried && keywords.length > 0) {
+      const altStart = await findAlternativeStart(graph, startWord, keywords, new Set(), retrySet);
+      if (altStart && altStart !== startWord) {
+        // FIX 3: Add altStart to retrySet to prevent infinite loops
+        retrySet.add(altStart);
+        console.log(`   🔄 Dead-end recovery: "${startWord}" → "${altStart}"`);
+        return walkGraph(graph, altStart, maxLength, keywords, true, retrySet);
+      }
+    }
+    return [startWord];
+  }
   
   const path = [startWord];
   const visited = new Set([startWord]);
   let current = startWord;
+  let lastCategory = graph.get(startWord).category;
   
   while (path.length < maxLength) {
-    const edges = graph.get(current);
-    if (!edges || edges.length === 0) break;
-    
-    // Pick next word - weighted random
-    let next = null;
-    for (const edge of edges) {
-      if (!visited.has(edge.word)) {
-        // Higher weight = more likely to be picked
-        if (!next || Math.random() < edge.weight * 0.5) {
-          next = edge.word;
-          if (Math.random() < 0.7) break; // Usually take first valid
+    const node = graph.get(current);
+    if (!node || node.edges.length === 0) {
+      // Dead-end recovery - try alternative start if not retried
+      if (!retried && path.length < GENERATION_CONFIG.minWords) {
+        const altStart = await findAlternativeStart(graph, current, keywords, visited, retrySet);
+        if (altStart) {
+          // FIX 3: Add altStart to retrySet to prevent infinite loops
+          retrySet.add(altStart);
+          console.log(`   🔄 Dead-end at "${current}", recovering with "${altStart}"`);
+          // Continue from alternative instead of full restart
+          if (!visited.has(altStart)) {
+            path.push(altStart);
+            visited.add(altStart);
+            current = altStart;
+            lastCategory = graph.get(altStart)?.category || 'unclassified';
+            continue;
+          }
         }
       }
+      break;
     }
     
-    if (!next) break;
+    const next = selectNextWord(node.edges, node.category, visited, lastCategory);
     
-    path.push(next);
-    visited.add(next);
-    current = next;
+    if (!next || next.weight < GENERATION_CONFIG.strengthThreshold) {
+      // Dead-end recovery on no valid next word
+      if (!retried && path.length < GENERATION_CONFIG.minWords) {
+        const altStart = await findAlternativeStart(graph, current, keywords, visited, retrySet);
+        if (altStart && !visited.has(altStart)) {
+          // FIX 3: Add altStart to retrySet to prevent infinite loops
+          retrySet.add(altStart);
+          console.log(`   🔄 No valid edges from "${current}", trying "${altStart}"`);
+          path.push(altStart);
+          visited.add(altStart);
+          current = altStart;
+          lastCategory = graph.get(altStart)?.category || 'unclassified';
+          retried = true; // Only retry once
+          continue;
+        }
+      }
+      break;
+    }
+    
+    path.push(next.word);
+    visited.add(next.word);
+    lastCategory = next.category;
+    current = next.word;
   }
   
   return path;
 }
 
 // ===============================================
-// NEW: BUILD CLUSTER GRAPH
-// Creates a graph where nodes are clusters and
-// edges are weighted cluster links
+// FIND ALTERNATIVE START WORD FOR DEAD-END RECOVERY
 // ===============================================
-async function buildClusterGraph(inputClusters, keywords) {
-  const graph = new Map();
-  const clusterScores = new Map();
-  
-  // Find relevant clusters from input
-  const relevantClusters = new Set();
-  
-  // Add input clusters
-  for (const cluster of inputClusters) {
-    relevantClusters.add(cluster.key);
-  }
-  
-  // Search for clusters containing keywords
-  for (const keyword of keywords.slice(0, 5)) {
-    const found = await searchClustersByWord(keyword, { limit: 20 });
-    for (const cluster of found) {
-      relevantClusters.add(cluster.key);
-      clusterScores.set(cluster.key, Math.max(
-        clusterScores.get(cluster.key) || 0,
-        cluster.score
-      ));
-    }
-  }
-  
-  // Get top cluster links overall (for fallback)
-  const topLinks = await getTopClusterLinks({ limit: 100 });
-  
-  // Build graph from cluster links
-  for (const link of topLinks) {
-    const { from_cluster, to_cluster, score } = link;
-    
-    if (!graph.has(from_cluster)) {
-      graph.set(from_cluster, []);
-    }
-    
-    graph.get(from_cluster).push({
-      cluster: to_cluster,
-      weight: score,
-      direction: link.direction
-    });
-    
-    // Also add reverse for bidirectional links
-    if (link.direction === 'bidirectional') {
-      if (!graph.has(to_cluster)) {
-        graph.set(to_cluster, []);
+
+async function findAlternativeStart(graph, excludeWord, keywords, visited = new Set(), retrySet = new Set()) {
+  // Priority 1: Other keywords in graph
+  for (const keyword of keywords) {
+    // FIX 3: Never choose a token that exists in retrySet
+    if (keyword !== excludeWord && graph.has(keyword) && !visited.has(keyword) && !retrySet.has(keyword)) {
+      const node = graph.get(keyword);
+      if (node.edges.length > 0) {
+        return keyword;
       }
-      graph.get(to_cluster).push({
-        cluster: from_cluster,
-        weight: score * 0.8, // Slightly lower for reverse
-        direction: 'bidirectional'
+    }
+  }
+  
+  // Priority 2: Stable tokens with most connections
+  let bestStable = null;
+  let bestStableScore = 0;
+  
+  for (const [word, node] of graph) {
+    // FIX 3: Never choose a token that exists in retrySet
+    if (word === excludeWord || visited.has(word) || retrySet.has(word)) continue;
+    if (node.category === 'stable' && node.edges.length > bestStableScore) {
+      bestStable = word;
+      bestStableScore = node.edges.length;
+    }
+  }
+  
+  if (bestStable) return bestStable;
+  
+  // Priority 3: Any word with highest degree
+  let bestWord = null;
+  let bestDegree = 0;
+  
+  for (const [word, node] of graph) {
+    // FIX 3: Never choose a token that exists in retrySet
+    if (word === excludeWord || visited.has(word) || retrySet.has(word)) continue;
+    if (node.edges.length > bestDegree) {
+      bestWord = word;
+      bestDegree = node.edges.length;
+    }
+  }
+  
+  return bestWord;
+}
+
+// ===============================================
+// FIND BEST STARTING WORD
+// ===============================================
+
+async function findBestStartWord(keywords, graph) {
+  // Priority 1: Keywords that exist in graph
+  const keywordsInGraph = keywords.filter(k => graph.has(k));
+  
+  if (keywordsInGraph.length > 0) {
+    // Score by category weight and connection count
+    const scored = [];
+    
+    for (const keyword of keywordsInGraph) {
+      const node = graph.get(keyword);
+      const categoryWeight = GENERATION_CONFIG.startingWeights[node.category] || 0.5;
+      const connectionScore = Math.min(1, node.edges.length / 10);
+      
+      scored.push({
+        word: keyword,
+        score: categoryWeight * (1 + connectionScore) * (1 + Math.random() * 0.3)
       });
     }
-  }
-  
-  // Sort edges by weight
-  for (const [, edges] of graph) {
-    edges.sort((a, b) => b.weight - a.weight);
-  }
-  
-  // Add neighbors for relevant clusters
-  for (const clusterKey of relevantClusters) {
-    const links = await getClusterLinks(clusterKey, { limit: 10 });
     
-    if (!graph.has(clusterKey)) {
-      graph.set(clusterKey, []);
+    scored.sort((a, b) => b.score - a.score);
+    return scored[0].word;
+  }
+  
+  // Priority 2: Highest-connected stable word
+  let bestWord = null;
+  let bestScore = 0;
+  
+  for (const [word, node] of graph) {
+    if (node.category === 'stable' && node.edges.length > bestScore) {
+      bestWord = word;
+      bestScore = node.edges.length;
     }
+  }
+  
+  if (bestWord) return bestWord;
+  
+  // Priority 3: Any word with most connections
+  for (const [word, node] of graph) {
+    if (node.edges.length > bestScore) {
+      bestWord = word;
+      bestScore = node.edges.length;
+    }
+  }
+  
+  return bestWord;
+}
+
+// ===============================================
+// EMERGENT PHRASE DISCOVERY
+// Build longer phrases from overlapping pairs
+// ===============================================
+
+async function discoverEmergentPhrases(keywords, maxPhrases = 3) {
+  const phrases = [];
+  
+  for (const keyword of keywords.slice(0, 5)) {
+    // Get chains starting from this keyword
+    const chains = await getEmergentChains(keyword, 5);
     
-    for (const link of links) {
-      // Check if edge already exists
-      const exists = graph.get(clusterKey).some(e => e.cluster === link.to_cluster);
-      if (!exists) {
-        graph.get(clusterKey).push({
-          cluster: link.to_cluster,
-          weight: link.score,
-          direction: link.direction
+    for (const chain of chains) {
+      if (chain.length >= 2) {
+        phrases.push({
+          words: chain,
+          strength: 1.0 / chain.length // Shorter chains are stronger
         });
       }
     }
-    
-    // Re-sort
-    graph.get(clusterKey).sort((a, b) => b.weight - a.weight);
   }
   
-  return { graph, relevantClusters: Array.from(relevantClusters), clusterScores };
-}
-
-// ===============================================
-// NEW: WALK CLUSTER GRAPH
-// Follows cluster links to build a coherent sequence
-// ===============================================
-function walkClusterGraph(graph, startCluster, maxClusters = 6) {
-  if (!graph.has(startCluster)) {
-    return [startCluster];
-  }
-  
-  const path = [startCluster];
-  const visitedClusters = new Set([startCluster]);
-  // Track individual words to avoid too much repetition
-  const usedWords = new Set(startCluster.split('_'));
-  let current = startCluster;
-  
-  while (path.length < maxClusters) {
-    const edges = graph.get(current);
-    if (!edges || edges.length === 0) break;
-    
-    // Find next cluster
-    let next = null;
-    let nextWeight = 0;
-    
-    for (const edge of edges) {
-      if (visitedClusters.has(edge.cluster)) continue;
-      
-      // Check word overlap - avoid too much repetition
-      const clusterWords = edge.cluster.split('_');
-      const overlapCount = clusterWords.filter(w => usedWords.has(w)).length;
-      
-      // Allow some overlap (for continuity) but not too much
-      if (overlapCount > clusterWords.length * 0.5) continue;
-      
-      // Weight includes link score plus randomness
-      const effectiveWeight = edge.weight * (1 + Math.random() * GENERATION_CONFIG.randomnessFactor);
-      
-      if (!next || effectiveWeight > nextWeight) {
-        next = edge.cluster;
-        nextWeight = effectiveWeight;
-      }
-      
-      // Sometimes accept first good option
-      if (Math.random() < 0.6 && edge.weight > GENERATION_CONFIG.linkScoreThreshold) {
-        break;
-      }
-    }
-    
-    if (!next) break;
-    
-    path.push(next);
-    visitedClusters.add(next);
-    
-    // Track words
-    for (const word of next.split('_')) {
-      usedWords.add(word);
-    }
-    
-    current = next;
-  }
-  
-  return path;
-}
-
-// ===============================================
-// NEW: MERGE CLUSTER SEQUENCE INTO TEXT
-// Intelligently joins clusters, removing duplicates
-// ===============================================
-function mergeClustersToText(clusterPath) {
-  if (clusterPath.length === 0) return '';
-  if (clusterPath.length === 1) return clusterPath[0].replace(/_/g, ' ');
-  
-  const result = [];
-  let lastWords = [];
-  
-  for (const clusterKey of clusterPath) {
-    const words = clusterKey.split('_');
-    
-    // Find overlap with previous cluster
-    let overlapStart = 0;
-    if (lastWords.length > 0) {
-      // Check if first word(s) of current cluster match last word(s) of previous
-      for (let i = 1; i <= Math.min(words.length, lastWords.length); i++) {
-        const prevEnd = lastWords.slice(-i);
-        const currStart = words.slice(0, i);
-        if (prevEnd.join('_') === currStart.join('_')) {
-          overlapStart = i;
-        }
-      }
-    }
-    
-    // Add non-overlapping words
-    const newWords = words.slice(overlapStart);
-    result.push(...newWords);
-    
-    lastWords = words;
-  }
-  
-  return result.join(' ');
-}
-
-// ===============================================
-// NEW: FIND BEST STARTING CLUSTER
-// ===============================================
-async function findBestStartCluster(inputClusters, keywords, graph, relevantClusters) {
-  // Priority 1: Input clusters that exist in graph with outgoing edges
-  for (const cluster of inputClusters) {
-    if (graph.has(cluster.key) && graph.get(cluster.key).length > 0) {
-      return cluster.key;
-    }
-  }
-  
-  // Priority 2: Relevant clusters from keyword search
-  for (const clusterKey of relevantClusters) {
-    if (graph.has(clusterKey) && graph.get(clusterKey).length > 0) {
-      return clusterKey;
-    }
-  }
-  
-  // Priority 3: Any cluster containing a keyword
-  for (const keyword of keywords) {
-    for (const [clusterKey, edges] of graph) {
-      if (clusterKey.includes(keyword) && edges.length > 0) {
-        return clusterKey;
-      }
-    }
-  }
-  
-  // Priority 4: Highest-connected cluster
-  let bestCluster = null;
-  let bestEdgeCount = 0;
-  
-  for (const [clusterKey, edges] of graph) {
-    if (edges.length > bestEdgeCount) {
-      bestCluster = clusterKey;
-      bestEdgeCount = edges.length;
-    }
-  }
-  
-  return bestCluster;
+  // Sort by strength and return top phrases
+  phrases.sort((a, b) => b.strength - a.strength);
+  return phrases.slice(0, maxPhrases);
 }
 
 // ===============================================
 // GENERATE RESPONSE
 // ===============================================
+
 export async function generateResponse(userMessage, options = {}) {
   const { maxLength = 150 } = options;
   
-  console.log(`\n🧠 ARIA: "${userMessage.substring(0, 40)}..."`);
+  console.log(`\n╔════════════════════════════════════════════════╗`);
+  console.log(`║ ARIA GENERATING: "${userMessage.substring(0, 30)}..."`);
+  console.log(`╚════════════════════════════════════════════════╝`);
   
   // Get memory stats
-  const ariaStats = await getMemoryStats();
-  const ariaTotal = ariaStats.tiers.short + ariaStats.tiers.medium + ariaStats.tiers.long;
+  const stats = await getMemoryStats();
+  const totalPairs = stats.tiers.short + stats.tiers.medium + stats.tiers.long;
   
-  console.log(`   ARIA: ${ariaTotal} correlations, ${ariaStats.clusterLinks || 0} cluster links`);
+  console.log(`📊 Memory: ${totalPairs} pairs, ${stats.tokens} tokens`);
+  console.log(`   Categories: S:${stats.categories.stable} T:${stats.categories.transition} M:${stats.categories.modifier} St:${stats.categories.structural}`);
   
   // Empty memory = silence
-  if (ariaTotal === 0 && (!ariaStats.clusterLinks || ariaStats.clusterLinks === 0)) {
-    console.log(`   ⚠️ No memory`);
+  if (totalPairs === 0) {
+    console.log(`   ⚠️ No memory - returning silence`);
     return "...";
   }
   
-  // Extract words and clusters from user message
+  // Extract keywords from input
   const keywords = extractWords(userMessage);
-  const inputClusters = extractInputClusters(userMessage);
-  console.log(`   Words: ${keywords.slice(0, 5).join(', ')}...`);
-  console.log(`   Input clusters: ${inputClusters.length}`);
+  console.log(`   Keywords: ${keywords.slice(0, 5).join(', ')}${keywords.length > 5 ? '...' : ''}`);
   
   let response = '';
   
-  // ===== TRY CLUSTER-BASED GENERATION FIRST =====
-  if (GENERATION_CONFIG.useClusterLinks && ariaStats.clusterLinks > 0) {
-    console.log(`   🔗 Attempting cluster-based generation...`);
+  // ===== METHOD 1: Try emergent phrase discovery =====
+  console.log(`\n🌱 Attempting emergent phrase discovery...`);
+  
+  try {
+    const emergentPhrases = await discoverEmergentPhrases(keywords);
+    
+    if (emergentPhrases.length > 0) {
+      console.log(`   Found ${emergentPhrases.length} emergent phrases`);
+      
+      // Use the best emergent phrases
+      const usedWords = new Set();
+      const fragments = [];
+      
+      for (const phrase of emergentPhrases) {
+        // Skip if too much overlap with used words
+        const overlap = phrase.words.filter(w => usedWords.has(w)).length;
+        if (overlap > phrase.words.length * 0.5) continue;
+        
+        fragments.push(phrase.words.join(' '));
+        phrase.words.forEach(w => usedWords.add(w));
+        
+        if (usedWords.size >= GENERATION_CONFIG.maxWords) break;
+      }
+      
+      if (fragments.length > 0) {
+        response = fragments.join(' ');
+        console.log(`   ✅ Emergent: "${response}"`);
+      }
+    }
+  } catch (error) {
+    console.log(`   ⚠️ Emergent discovery error: ${error.message}`);
+  }
+  
+  // ===== METHOD 2: Graph walking =====
+  if (!response || response.split(' ').length < GENERATION_CONFIG.minWords) {
+    console.log(`\n📈 Attempting graph walk...`);
     
     try {
-      // Build cluster graph
-      const { graph, relevantClusters, clusterScores } = await buildClusterGraph(inputClusters, keywords);
+      // Get relevant pairs
+      const relevantPairs = [];
       
-      console.log(`   📊 Cluster graph: ${graph.size} nodes`);
+      // Search for pairs containing keywords
+      for (const keyword of keywords.slice(0, 10)) {
+        const pairs = await searchByWord(keyword);
+        relevantPairs.push(...pairs);
+      }
       
-      if (graph.size > 0) {
-        // Find best starting cluster
-        const startCluster = await findBestStartCluster(inputClusters, keywords, graph, relevantClusters);
+      // Get top pairs from memory
+      const topPairs = await getTopPairs({ limit: 100 });
+      relevantPairs.push(...topPairs);
+      
+      // Deduplicate
+      const seen = new Set();
+      const uniquePairs = relevantPairs.filter(p => {
+        const key = p.pattern_key;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+      
+      console.log(`   Building graph from ${uniquePairs.length} pairs`);
+      
+      if (uniquePairs.length > 0) {
+        // Build word graph
+        const graph = await buildWordGraph(uniquePairs);
+        console.log(`   Graph: ${graph.size} words`);
         
-        if (startCluster) {
-          console.log(`   🚀 Starting from: "${startCluster}"`);
+        if (graph.size > 0) {
+          // Find best starting word
+          const startWord = await findBestStartWord(keywords, graph);
           
-          // Walk the cluster graph
-          const clusterPath = walkClusterGraph(graph, startCluster, GENERATION_CONFIG.maxClusters);
-          
-          console.log(`   📍 Path: ${clusterPath.length} clusters`);
-          
-          if (clusterPath.length >= GENERATION_CONFIG.minClusters) {
-            // Merge clusters into text
-            response = mergeClustersToText(clusterPath);
-            console.log(`   ✅ Cluster response: "${response}"`);
+          if (startWord) {
+            console.log(`   Starting from: "${startWord}"`);
+            
+            // Walk the graph (pass keywords for dead-end recovery)
+            const path = await walkGraph(graph, startWord, GENERATION_CONFIG.maxWords, keywords);
+            
+            if (path.length >= GENERATION_CONFIG.minWords) {
+              response = path.join(' ');
+              console.log(`   ✅ Graph walk: "${response}"`);
+            }
           }
         }
       }
     } catch (error) {
-      console.log(`   ⚠️ Cluster generation error: ${error.message}`);
+      console.log(`   ⚠️ Graph walk error: ${error.message}`);
     }
   }
   
-  // ===== FALL BACK TO WORD GRAPH IF NEEDED =====
-  if (!response && GENERATION_CONFIG.fallbackToWordGraph) {
-    console.log(`   📚 Falling back to word graph...`);
+  // ===== METHOD 3: Category-based composition =====
+  if (!response || response.split(' ').length < GENERATION_CONFIG.minWords) {
+    console.log(`\n🏷️ Attempting category-based composition...`);
     
-    // Find related ARIA correlations
-    const ariaCorrs = [];
-    for (const kw of keywords.slice(0, 10)) {
-      const related = await searchByWord(kw);
-      ariaCorrs.push(...related);
-    }
-    
-    // Get top memory
-    const topMemory = await getMemoryContext({ limit: 100 });
-    
-    // Combine all correlations
-    const allCorrs = [
-      ...ariaCorrs,
-      ...topMemory.short,
-      ...topMemory.medium,
-      ...topMemory.long
-    ];
-    
-    // Deduplicate
-    const seen = new Set();
-    const uniqueCorrs = allCorrs.filter(c => {
-      const key = `${c.word1}_${c.word2}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-    
-    console.log(`   Correlations: ${uniqueCorrs.length}`);
-    
-    if (uniqueCorrs.length > 0) {
-      // Build word graph
-      const graph = buildWordGraph(uniqueCorrs);
-      console.log(`   Graph: ${graph.size} words`);
+    try {
+      const fragments = [];
       
-      if (graph.size > 0) {
-        // Find starting words (prefer keywords that exist in graph)
-        const startWords = keywords.filter(k => graph.has(k));
-        if (startWords.length === 0) {
-          // Use random graph nodes
-          startWords.push(...[...graph.keys()].slice(0, 3));
-        }
+      // Get stable words (nouns) first
+      const stableTokens = await getTokensByCategory('stable', 5);
+      
+      if (stableTokens.length > 0) {
+        // Find stable tokens related to keywords
+        const relevantStable = stableTokens.filter(t => 
+          keywords.some(k => t.token.includes(k) || k.includes(t.token))
+        );
         
-        // Walk from multiple starts
-        const fragments = [];
-        const usedWords = new Set();
+        const baseToken = relevantStable.length > 0 ? relevantStable[0] : stableTokens[0];
         
-        for (const start of startWords.slice(0, 3)) {
-          if (usedWords.has(start)) continue;
+        // Find pairs for this token
+        const pairs = await searchByWord(baseToken.token);
+        
+        // FIX 1: Extract all "other" tokens and batch-fetch their categories
+        const otherTokens = pairs.map(p => 
+          p.token_a === baseToken.token ? p.token_b : p.token_a
+        ).filter(Boolean);
+        
+        const categoryMap = new Map();
+        if (otherTokens.length > 0) {
+          const { data: tokenStats } = await supabase
+            .from('aria_token_stats')
+            .select('token, category')
+            .in('token', otherTokens);
           
-          const path = walkGraph(graph, start, 4 + Math.floor(Math.random() * 4));
-          
-          if (path.length >= 2) {
-            path.forEach(w => usedWords.add(w));
-            fragments.push(path);
+          if (tokenStats) {
+            for (const stat of tokenStats) {
+              categoryMap.set(stat.token, stat.category || 'unclassified');
+            }
           }
         }
         
-        // Include phrases
-        if (topMemory.phrases && topMemory.phrases.length > 0) {
-          const relevantPhrases = topMemory.phrases
-            .filter(p => p.words && p.words.some(w => keywords.includes(w) || usedWords.has(w)))
-            .slice(0, 2);
-          
-          for (const phrase of relevantPhrases) {
-            fragments.push(phrase.words);
+        // FIX 1: Filter pairs by dynamically fetched category (not category_pattern)
+        const modifierPairs = pairs.filter(p => {
+          const other = p.token_a === baseToken.token ? p.token_b : p.token_a;
+          return categoryMap.get(other) === 'modifier';
+        });
+        
+        // FIX 7: Add variability - 30% chance to skip modifier
+        const skipModifier = Math.random() < 0.3;
+        
+        let modifier = null;
+        if (!skipModifier && modifierPairs.length > 0) {
+          modifier = modifierPairs[0].token_a === baseToken.token 
+            ? modifierPairs[0].token_b 
+            : modifierPairs[0].token_a;
+        }
+        
+        // FIX 1: Filter transition pairs by dynamically fetched category
+        const transitionPairs = pairs.filter(p => {
+          const other = p.token_a === baseToken.token ? p.token_b : p.token_a;
+          return categoryMap.get(other) === 'transition';
+        });
+        
+        let transition = null;
+        if (transitionPairs.length > 0) {
+          transition = transitionPairs[0].token_a === baseToken.token
+            ? transitionPairs[0].token_b
+            : transitionPairs[0].token_a;
+        }
+        
+        // FIX 7: 20% chance to insert structural word between stable and transition
+        let structural = null;
+        if (Math.random() < 0.2) {
+          // FIX 1: Filter structural pairs by dynamically fetched category
+          const structuralPairs = pairs.filter(p => {
+            const other = p.token_a === baseToken.token ? p.token_b : p.token_a;
+            return categoryMap.get(other) === 'structural';
+          });
+          if (structuralPairs.length > 0) {
+            structural = structuralPairs[0].token_a === baseToken.token
+              ? structuralPairs[0].token_b
+              : structuralPairs[0].token_a;
           }
         }
         
-        // Build response from fragments
-        if (fragments.length > 0) {
-          response = fragments.map(f => f.join(' ')).join(' ');
-        } else {
-          // Fallback: use strongest correlations
-          const strong = uniqueCorrs
-            .filter(c => c.correlation_score > 0.2)
-            .slice(0, 3);
-          
-          if (strong.length > 0) {
-            response = strong.map(c => `${c.word1} ${c.word2}`).join(' ');
-          }
+        // FIX 7: Randomize order - sometimes modifier → stable, sometimes stable → modifier
+        const reverseModifierOrder = Math.random() < 0.3;
+        
+        // Build fragments with variability
+        if (modifier && !reverseModifierOrder) {
+          fragments.push(modifier);
+        }
+        
+        fragments.push(baseToken.token);
+        
+        if (modifier && reverseModifierOrder) {
+          fragments.push(modifier);
+        }
+        
+        if (structural && transition) {
+          // Insert structural between stable and transition
+          fragments.push(structural);
+        }
+        
+        if (transition) {
+          fragments.push(transition);
         }
       }
+      
+      if (fragments.length > 0) {
+        response = fragments.join(' ');
+        console.log(`   ✅ Category composition: "${response}"`);
+      }
+    } catch (error) {
+      console.log(`   ⚠️ Category composition error: ${error.message}`);
+    }
+  }
+  
+  // ===== METHOD 4: Raw pair fallback =====
+  if (!response || response.split(' ').length < 2) {
+    console.log(`\n🔗 Falling back to raw pairs...`);
+    
+    try {
+      const topPairs = await getTopPairs({ limit: 5 });
+      
+      if (topPairs.length > 0) {
+        // Find pairs related to keywords
+        const relevantPairs = topPairs.filter(p =>
+          keywords.some(k => p.token_a.includes(k) || p.token_b.includes(k) ||
+                            k.includes(p.token_a) || k.includes(p.token_b))
+        );
+        
+        const usePairs = relevantPairs.length > 0 ? relevantPairs : topPairs;
+        
+        response = usePairs
+          .slice(0, 3)
+          .map(p => `${p.token_a} ${p.token_b}`)
+          .join(' ');
+        
+        console.log(`   ✅ Raw pairs: "${response}"`);
+      }
+    } catch (error) {
+      console.log(`   ⚠️ Raw pair error: ${error.message}`);
     }
   }
   
   // ===== FINAL CLEANUP =====
   if (!response) {
+    console.log(`   ⚠️ No response generated`);
     return "...";
   }
   
-  // Clean up
+  // Clean up response
   response = response
+    .toLowerCase()
     .replace(/\s+/g, ' ')
-    .trim()
-    .toLowerCase();
+    .trim();
   
-  // Truncate
+  // Remove duplicate consecutive words
+  const words = response.split(' ');
+  const deduped = words.filter((word, i) => i === 0 || word !== words[i - 1]);
+  response = deduped.join(' ');
+  
+  // Truncate if too long
   if (response.length > maxLength) {
     response = response.substring(0, maxLength).trim();
     const lastSpace = response.lastIndexOf(' ');
@@ -537,7 +681,7 @@ export async function generateResponse(userMessage, options = {}) {
     }
   }
   
-  console.log(`   ✅ "${response}"`);
+  console.log(`\n✨ FINAL: "${response}"`);
   
   return response || "...";
 }
@@ -545,74 +689,142 @@ export async function generateResponse(userMessage, options = {}) {
 // ===============================================
 // QUERY MEMORY (for API)
 // ===============================================
+
 export async function queryMemory(query) {
   const keywords = extractWords(query);
   
-  const ariaCorrs = [];
-  for (const kw of keywords) {
-    const related = await searchByWord(kw);
-    ariaCorrs.push(...related);
+  const results = [];
+  for (const keyword of keywords) {
+    const pairs = await searchByWord(keyword);
+    results.push(...pairs);
   }
   
-  // Dedupe
+  // Deduplicate
   const seen = new Set();
-  const unique = ariaCorrs.filter(c => {
-    if (seen.has(c.id)) return false;
-    seen.add(c.id);
+  const unique = results.filter(r => {
+    if (seen.has(r.id)) return false;
+    seen.add(r.id);
     return true;
   });
   
-  unique.sort((a, b) => b.correlation_score - a.correlation_score);
+  unique.sort((a, b) => b.strength - a.strength);
   
-  // Also get cluster data
-  const clusterResults = [];
-  for (const kw of keywords.slice(0, 3)) {
-    const clusters = await searchClustersByWord(kw, { limit: 10 });
-    clusterResults.push(...clusters);
+  // Get token stats for keywords
+  const tokenStats = [];
+  for (const keyword of keywords.slice(0, 5)) {
+    const stats = await getTokenStats(keyword);
+    if (stats) {
+      tokenStats.push(stats);
+    }
   }
   
-  return { 
-    keywords, 
-    correlations: unique,
-    clusters: clusterResults
+  // Get emergent chains
+  const chains = [];
+  for (const keyword of keywords.slice(0, 3)) {
+    const keywordChains = await getEmergentChains(keyword, 4);
+    chains.push(...keywordChains.map(c => c.join(' ')));
+  }
+  
+  return {
+    keywords,
+    pairs: unique.slice(0, 50),
+    tokenStats,
+    emergentChains: [...new Set(chains)].slice(0, 10)
   };
 }
 
 // ===============================================
-// BUILD CONTEXT (for API inspection)
+// BUILD MEMORY CONTEXT (for API inspection)
 // ===============================================
+
 export async function buildMemoryContext(userMessage) {
-  const ariaStats = await getMemoryStats();
+  const stats = await getMemoryStats();
   const keywords = extractWords(userMessage || '');
   const topMemory = await getMemoryContext({ limit: 30 });
   
-  let context = `ARIA: ${ariaStats.tiers.short + ariaStats.tiers.medium + ariaStats.tiers.long} correlations\n`;
-  context += `Cluster Links: ${ariaStats.clusterLinks || 0}\n`;
-  context += `Phrases: ${ariaStats.phrases}\n`;
-  context += `Messages: ${ariaStats.messagesProcessed}\n\n`;
+  let context = `═══════════════════════════════════════\n`;
+  context += `ARIA EMERGENT LINGUISTIC SYSTEM\n`;
+  context += `═══════════════════════════════════════\n\n`;
+  
+  context += `📊 MEMORY STATE\n`;
+  context += `   Pairs: ${stats.tiers.short + stats.tiers.medium + stats.tiers.long}\n`;
+  context += `   └─ Short: ${stats.tiers.short}\n`;
+  context += `   └─ Medium: ${stats.tiers.medium}\n`;
+  context += `   └─ Long: ${stats.tiers.long}\n`;
+  context += `   └─ Decay: ${stats.decay}\n`;
+  context += `   Tokens: ${stats.tokens}\n`;
+  context += `   Messages: ${stats.messagesProcessed}\n\n`;
+  
+  context += `🏷️ EMERGENT CATEGORIES\n`;
+  context += `   Stable (noun-like): ${stats.categories.stable}\n`;
+  context += `   Transition (verb-like): ${stats.categories.transition}\n`;
+  context += `   Modifier (adjective-like): ${stats.categories.modifier}\n`;
+  context += `   Structural (function words): ${stats.categories.structural}\n\n`;
   
   if (topMemory.long.length > 0) {
-    context += `Strong Correlations:\n`;
-    for (const c of topMemory.long.slice(0, 10)) {
-      context += `  ${c.word1} + ${c.word2} (${c.correlation_score.toFixed(2)})\n`;
+    context += `🔗 STRONG PAIRS (long-term)\n`;
+    for (const pair of topMemory.long.slice(0, 10)) {
+      context += `   ${pair.token_a} + ${pair.token_b} (${pair.strength.toFixed(3)}) [${pair.category_pattern}]\n`;
     }
+    context += `\n`;
   }
   
-  // Add cluster link info
-  const topLinks = await getTopClusterLinks({ limit: 10 });
-  if (topLinks.length > 0) {
-    context += `\nTop Cluster Links:\n`;
-    for (const link of topLinks) {
-      context += `  ${link.from_cluster} → ${link.to_cluster} (${link.score.toFixed(3)})\n`;
+  if (keywords.length > 0) {
+    context += `🔍 QUERY KEYWORDS: ${keywords.join(', ')}\n\n`;
+    
+    // Show emergent chains for keywords
+    for (const keyword of keywords.slice(0, 2)) {
+      const chains = await getEmergentChains(keyword, 4);
+      if (chains.length > 0) {
+        context += `   Chains from "${keyword}":\n`;
+        for (const chain of chains.slice(0, 3)) {
+          context += `   └─ ${chain.join(' → ')}\n`;
+        }
+      }
     }
   }
   
   return context;
 }
 
+// ===============================================
+// CATEGORY ANALYSIS (for API)
+// ===============================================
+
+export async function analyzeCategories() {
+  const stable = await getTokensByCategory('stable', 20);
+  const transition = await getTokensByCategory('transition', 20);
+  const modifier = await getTokensByCategory('modifier', 20);
+  const structural = await getTokensByCategory('structural', 20);
+  
+  return {
+    stable: stable.map(t => ({
+      token: t.token,
+      occurrences: t.total_occurrences,
+      score: t.stability_score
+    })),
+    transition: transition.map(t => ({
+      token: t.token,
+      occurrences: t.total_occurrences,
+      score: t.transition_score
+    })),
+    modifier: modifier.map(t => ({
+      token: t.token,
+      occurrences: t.total_occurrences,
+      score: t.dependency_score
+    })),
+    structural: structural.map(t => ({
+      token: t.token,
+      occurrences: t.total_occurrences,
+      score: t.structural_score
+    }))
+  };
+}
+
 export default {
   generateResponse,
   queryMemory,
   buildMemoryContext,
+  analyzeCategories,
   getMemoryStats
 };

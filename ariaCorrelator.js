@@ -53,10 +53,10 @@ const CONFIG = {
   ADJACENCY_WINDOW: 2,
   
   // Minimum occurrences before category assignment
-  MIN_OCCURRENCES_FOR_CATEGORY: 5,
+  MIN_OCCURRENCES_FOR_CATEGORY: 2,
   
   // Category score threshold
-  CATEGORY_THRESHOLD: 0.5,
+  CATEGORY_THRESHOLD: 0.15,
   
   // Promotion speed modifiers by category
   PROMOTION_MODIFIERS: {

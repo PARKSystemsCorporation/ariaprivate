@@ -194,11 +194,15 @@ async function walkGraph(graph, startWord, maxLength, keywords = [], retried = f
     retrySet = new Set();
   }
   
+  // Initialize visited early to prevent circular recursion
+  const visited = new Set([startWord]);
+  
   if (!graph.has(startWord)) {
     // Dead-end recovery - try alternative start if not retried
     if (!retried && keywords.length > 0) {
-      const altStart = await findAlternativeStart(graph, startWord, keywords, new Set(), retrySet);
-      if (altStart && altStart !== startWord) {
+      const altStart = await findAlternativeStart(graph, startWord, keywords, visited, retrySet);
+      // FIX: Also check !visited.has(altStart) to prevent circular recursion
+      if (altStart && altStart !== startWord && !visited.has(altStart)) {
         // FIX 3: Add altStart to retrySet to prevent infinite loops
         retrySet.add(altStart);
         console.log(`   🔄 Dead-end recovery: "${startWord}" → "${altStart}"`);
@@ -209,7 +213,6 @@ async function walkGraph(graph, startWord, maxLength, keywords = [], retried = f
   }
   
   const path = [startWord];
-  const visited = new Set([startWord]);
   let current = startWord;
   let lastCategory = graph.get(startWord).category;
   
@@ -361,7 +364,8 @@ async function findBestStartWord(keywords, graph) {
     }
   }
   
-  return bestWord;
+  // Guarantee fallback - never return null if graph has nodes
+  return bestWord || Array.from(graph.keys())[0];
 }
 
 // ===============================================
@@ -531,10 +535,13 @@ export async function generateResponse(userMessage, options = {}) {
         // Find pairs for this token
         const pairs = await searchByWord(baseToken.token);
         
-        // FIX 1: Extract all "other" tokens and batch-fetch their categories
-        const otherTokens = pairs.map(p => 
-          p.token_a === baseToken.token ? p.token_b : p.token_a
-        ).filter(Boolean);
+        // FIX 1: Extract all unique "other" tokens and batch-fetch their categories
+        // Use Set to deduplicate - prevents massive .in() clause truncation
+        const otherTokens = [...new Set(
+          pairs.map(p => 
+            p.token_a === baseToken.token ? p.token_b : p.token_a
+          ).filter(Boolean)
+        )];
         
         const categoryMap = new Map();
         if (otherTokens.length > 0) {
